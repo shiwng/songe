@@ -66,3 +66,45 @@ def test_more_repeated_phrases_in_code_is_not_a_regression():
     one = metrics(0.8)
     one[0]["repetition"] = 0.9  # a single looping answer is not enough
     assert decide(metrics(), one, min_heldout=12, drift_limit=0.05).accepted
+
+
+def test_the_early_judged_check_agrees_with_the_full_decision():
+    """judged_check rejects exactly the judged moments decide() rejects, so
+    skipping a rejected candidate's rows never changes the outcome."""
+    import random
+
+    from songe.sleep.gate import judged_check
+
+    rng = random.Random(5)
+    for _ in range(300):
+        outcomes = [rng.choice(["win", "win", "loss", "tie"]) for _ in range(rng.randint(1, 24))]
+        before = metrics()[: len(outcomes)]
+        after = [r | {"outcome": o, "by": "judge"} for r, o in zip(metrics(), outcomes, strict=False)]
+        full = decide(before, after, min_heldout=1, drift_limit=0.05)
+        early = judged_check([{"id": r["id"], "outcome": r["outcome"]} for r in after])
+        assert (early is None) == full.accepted
+        if early is not None:
+            assert early.reason == full.reason and early.noise_margin == full.noise_margin
+
+
+def test_a_strength_rejected_early_costs_no_incumbent_rows():
+    from songe.sleep.gate import Decision, choose_scale
+
+    asked, discarded = [], []
+
+    def evaluate_scale(scale):
+        if scale == 1.0:
+            return {"early": Decision(False, "Not clearly better: better on 1, worse on 2").dict(),
+                    "judged": [{"id": "0", "outcome": "loss"}]}
+        return metrics(0.8)
+
+    def before():
+        asked.append(1)
+        return metrics()
+
+    scale, verdict, evaluations = choose_scale(
+        evaluate_scale, before, (1.0, 0.5), min_heldout=12, drift_limit=0.05,
+        discard=discarded.append)
+    assert scale == 0.5 and verdict.accepted and discarded == [1.0] and asked == [1]
+    assert evaluations["1.0"]["reason"].startswith("Not clearly better")
+    assert evaluations["1.0"]["judged"] == [{"id": "0", "outcome": "loss"}]

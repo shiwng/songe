@@ -122,6 +122,30 @@ def decide(
     return Decision(True, "Held-out improvement passed all checks", **result)
 
 
+def judged_check(judged, *, bootstraps=2000, confidence=0.95):
+    """decide()'s judged test alone, for rejecting a candidate before its
+    held-out rows are measured: the failing Decision, or None when the
+    judged moments still allow it to pass. judged: the moments' outcomes in
+    the gate's row order, as decide() sees them (the same resampling)."""
+    score = {"win": 1, "loss": -1, "tie": 0}
+    gains = [score[a["outcome"]] for a in judged]
+    if not gains:
+        return None
+    change = mean(gains)
+    rng = random.Random(7613)
+    samples = sorted(mean(rng.choices(gains, k=len(gains))) for _ in range(bootstraps))
+    lower = samples[int((1 - confidence) / 2 * bootstraps)]
+    margin = max(math.ulp(change), change - lower)
+    wins = sum(a["outcome"] == "win" for a in judged)
+    losses = sum(a["outcome"] == "loss" for a in judged)
+    if wins <= losses or change <= margin:
+        return Decision(
+            False, f"Not clearly better: better on {wins}, worse on {losses}",
+            heldout_change=change, noise_margin=margin,
+        )
+    return None
+
+
 def choose_scale(
     evaluate_scale,
     before,
@@ -137,13 +161,23 @@ def choose_scale(
     real gate is used. A failed strength is discarded before the next one is
     built, so at most one candidate exists. Scale zero keeps the incumbent and
     is never a candidate.
+
+    before: the incumbent's rows, or a function returning them (measured
+    only when a candidate needs them). evaluate_scale returns the
+    candidate's rows, or {"early": Decision dict, "judged": [...]} when it
+    was rejected before its rows were measured.
     """
     evaluations = {}
     for scale in sorted(set(scales), reverse=True):
         check()
         after = evaluate_scale(scale)
+        if isinstance(after, dict) and "early" in after:
+            verdict = Decision(**after["early"])
+            evaluations[str(scale)] = verdict.dict() | {"judged": after.get("judged") or []}
+            discard(scale)
+            continue
         verdict = decide(
-            before,
+            before() if callable(before) else before,
             after,
             min_heldout=min_heldout,
             drift_limit=drift_limit,

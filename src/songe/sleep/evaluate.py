@@ -393,6 +393,7 @@ def evaluate(
     identical=False,
     views=None,
     kept_as=None,
+    rows=True,
 ):
     """Gate rows for one version against the frozen base.
 
@@ -403,7 +404,9 @@ def evaluate(
     views: a dict shared by the versions of one gate, so the reference's
     read of each moment (the same for every version) is done once.
     kept_as: a KeptMeasurements for a version measured again on later
-    Dreams (the incumbent): moments it has measured are not measured again."""
+    Dreams (the incumbent): moments it has measured are not measured again.
+    rows=False: only the "not broken" measure; returns its value (a later
+    call with the same checkpoint goes on to the held-out rows)."""
     checkpoint = {} if checkpoint is None else checkpoint
     # The drift set first: the same measure on real contexts where the base
     # was right (confirmed successes). Never trained on. When it can decide
@@ -436,6 +439,8 @@ def evaluate(
     drift, checkpoint["drift_check"] = drift_choice(
         mean(drifts) if drifts else None, drift_set, list(drift_refs), candidate.config
     )
+    if not rows:
+        return drift
     rows = checkpoint.setdefault("rows", [])
     for r in refs[len(rows) :]:
         getattr(candidate, "boundary", candidate.check)()

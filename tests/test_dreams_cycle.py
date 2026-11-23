@@ -76,7 +76,11 @@ def dreams(config, store, monkeypatch):
     monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
     anchors = worker.general_steps()[:1]
     monkeypatch.setattr(worker, "general_steps", lambda: anchors)
-    monkeypatch.setattr(gate, "choose_scale", lambda *a, **kw: (None, Decision(False, "Test rejection"), {}))
+    def reject(scaled, before, *a, **kw):
+        before()  # as a candidate that reaches its rows: the incumbent's are measured then
+        return None, Decision(False, "Test rejection"), {}
+
+    monkeypatch.setattr(gate, "choose_scale", reject)
     return config, store
 
 
