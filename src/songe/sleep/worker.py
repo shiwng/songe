@@ -891,8 +891,18 @@ def run(config, store, slice_seconds=None, sizing=None):
             return general_memo[0]
 
         # The reference's read of each moment, shared by the versions below
-        # (it does not depend on the version measured).
-        views = {}
+        # (it does not depend on the version measured); the base's reads are
+        # kept across Dreams (KeptViews).
+        from .evaluate import KeptViews
+
+        views = (
+            KeptViews(
+                store.root / "gate-views",
+                [base, "r2", config.teacher_chunk, GATE_READ_CHUNK, config.torch_options or {}],
+            )
+            if backend.kind == "torch"
+            else {}
+        )
 
         def measured(name, candidate, identical=False, kept_as=None):
             # r2: how contexts are read (one layout, 4096-token chunks); rows

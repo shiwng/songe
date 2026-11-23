@@ -571,3 +571,29 @@ def test_one_prompt_read_serves_the_score_and_the_answer(backend, step):
     assert shared_answer == plain_answer
     with backend.base():
         assert backend.kl_from(backend, prompt, prompt, y) == 0.0
+
+
+def test_the_bases_reads_are_kept_across_dreams(backend, step, tmp_path):
+    """KeptViews: the frozen base's read of a moment is saved and read back
+    by the next Dream (same KL, no read); the cycle teacher's is not saved."""
+    from songe.sleep.evaluate import KeptViews
+
+    prompt, teacher = paired_prompts(backend.tokenizer, step, backend.config)
+    y = [1, 2, 3, 4]
+    backend.snapshot_teacher()
+    first = KeptViews(tmp_path, ["base-a"])
+    drift = backend.kl_from(backend, prompt, prompt, y, views=first)
+    backend.kl_from(backend, prompt, teacher, y, hindsight=True, views=first)
+    reads, original = [], backend.teacher_hidden
+
+    def counted(*args, **kw):
+        if len(args) < 3:
+            reads.append(1)
+        return original(*args, **kw)
+
+    backend.teacher_hidden = counted
+    later = KeptViews(tmp_path, ["base-a"])
+    assert backend.kl_from(backend, prompt, prompt, y, views=later) == pytest.approx(drift)
+    assert reads == []
+    backend.kl_from(backend, prompt, teacher, y, hindsight=True, views=later)
+    assert reads == [1]  # the teacher's read is not kept on disk

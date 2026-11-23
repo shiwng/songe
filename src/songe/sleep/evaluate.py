@@ -252,6 +252,48 @@ class KeptMeasurements:
         temporary.replace(path)
 
 
+class KeptViews(dict):
+    """kl_from's views (the reference's read of each moment, shared by the
+    versions of one gate) with the frozen base's reads kept on disk across
+    Dreams: the drift moments and bundled prompts are read by the same base
+    weights every night. The cycle teacher's reads change with the teacher
+    and stay in memory only. Torch tensors (torch.save)."""
+
+    def __init__(self, root, fingerprint):
+        super().__init__()
+        self.disk = KeptMeasurements(root, fingerprint)
+
+    def _file(self, key):
+        return self.disk.path("view", list(key[1:])).with_suffix(".pt")
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        if key[0]:  # the cycle teacher's read
+            return default
+        import torch
+
+        try:
+            value = torch.load(self._file(key), map_location="cpu", weights_only=True)
+        except (OSError, RuntimeError, ValueError, EOFError):
+            return default
+        super().__setitem__(key, value)
+        return value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if key[0]:
+            return
+        import torch
+
+        if not self.disk.pruned:
+            self.disk.put("marker", ["views"], 1)  # creates the folder, prunes others
+        path = self._file(key)
+        temporary = path.with_suffix(".tmp")
+        torch.save(value, temporary)
+        temporary.replace(path)
+
+
 def kept(cache, kind, ref, measure):
     """cache's value for this moment, else measure() (kept for next time)."""
     if cache is None:
