@@ -956,3 +956,42 @@ def test_a_pressed_deep_dream_whose_night_failed_retries_then_says_why(store):
     stopped = learner.get("dream_stopped")
     assert store.get("requested_sleep") is False and stopped["reason"] == "training"
     assert "failed 3 times" in stopped["detail"] and "SIGKILL" in stopped["detail"]
+
+
+def test_the_incumbents_measurements_are_kept_for_the_next_dream(tmp_path, config):
+    """kept_as: a second Dream with the same incumbent measures nothing it
+    measured before; a different fingerprint (a new incumbent) measures
+    again and replaces the old folder."""
+    from songe.sleep.evaluate import KeptMeasurements, evaluate
+
+    calls = []
+
+    class Fake:
+        def __init__(self):
+            self.config, self.tokenizer = config, None
+
+        def check(self):
+            pass
+
+        def kl_from(self, base, prompt, teacher, y, *, hindsight=False, **kw):
+            calls.append(("kl", prompt))
+            return 0.25
+
+        def sample(self, prompt, seed=None, **kw):
+            calls.append(("sample", prompt))
+            return [1], "done", None
+
+    v = Fake()
+    refs = [{"id": f"m{i}", "conversation": f"c{i}", "prompt": [i, 1], "teacher": [i, 2], "y": [3],
+             "tools": [], "tool_step": False} for i in range(3)]
+    drift_refs = [{"conversation": f"d{i}", "prompt": [9, i], "y": [4]} for i in range(12)]
+    first = evaluate(v, v, refs, [], drift_refs=drift_refs,
+                     kept_as=KeptMeasurements(tmp_path, ["incumbent-a"]))
+    assert len(calls) == 12 + 3 * 2
+    calls.clear()
+    again = evaluate(v, v, refs, [], drift_refs=drift_refs,
+                     kept_as=KeptMeasurements(tmp_path, ["incumbent-a"]))
+    assert calls == [] and again == first
+    evaluate(v, v, refs[:1], [], drift_refs=drift_refs,
+             kept_as=KeptMeasurements(tmp_path, ["incumbent-b"]))
+    assert len(calls) == 12 + 2 and len(list(tmp_path.iterdir())) == 1

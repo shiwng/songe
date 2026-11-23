@@ -35,6 +35,16 @@ from ..storage import private_dir, write_json
 GATE_READ_CHUNK = 4096
 
 
+def files_fingerprint(path):
+    """What a saved adapter is, for caches: its files' names, sizes and
+    modification times (a new adapter is written as new files)."""
+    path = Path(path)
+    files = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+    return digest([str(path)] + [
+        [p.name, p.stat().st_size, p.stat().st_mtime_ns] for p in files if p.exists()
+    ])
+
+
 def general_steps():
     prompts = json.loads(
         (Path(__file__).parent / "anchors.json").read_text(encoding="utf-8")
@@ -884,8 +894,10 @@ def run(config, store, slice_seconds=None, sizing=None):
         # (it does not depend on the version measured).
         views = {}
 
-        def measured(name, candidate, identical=False):
-            name += "-" + gate_key(heldout + anchors + drift_set)
+        def measured(name, candidate, identical=False, kept_as=None):
+            # r2: how contexts are read (one layout, 4096-token chunks); rows
+            # read another way are not comparable, so they are not resumed.
+            name += "-r2-" + gate_key(heldout + anchors + drift_set)
             cache = journal.load(name, {})
 
             def commit():
@@ -907,6 +919,7 @@ def run(config, store, slice_seconds=None, sizing=None):
                 commit=commit,
                 identical=identical,
                 views=views,
+                kept_as=kept_as,
             )
             # Which "not broken" measure gated, and why (see evaluate), and
             # the measured values, for the cycle record's checks.
@@ -920,6 +933,28 @@ def run(config, store, slice_seconds=None, sizing=None):
             }
             return rows
 
+        # The incumbent's measurements are kept for the next Dreams while
+        # what they depend on stays the same (KeptMeasurements).
+        from .evaluate import KeptMeasurements
+
+        incumbent_adapter = incumbent_version and (
+            incumbent_version.get("training_adapter") or incumbent_version.get("adapter")
+        )
+        kept_incumbent = KeptMeasurements(
+            store.root / "gate-incumbent",
+            [
+                base,
+                files_fingerprint(incumbent_adapter) if incumbent_adapter else "original",
+                files_fingerprint(previous_adapter) if previous_adapter else "base",  # the teacher
+                "r2",
+                backend.kind,
+                config.response_tokens,
+                config.repetition_ngram,
+                config.teacher_chunk,
+                GATE_READ_CHUNK,
+                sorted((config.torch_options or {}).items()),
+            ],
+        )
         # The incumbent and candidate share the original frozen base. Reuse
         # its trunk so evaluating the incumbent does not load a second base.
         if incumbent_version and (
@@ -932,11 +967,11 @@ def run(config, store, slice_seconds=None, sizing=None):
                     or incumbent_version["adapter"]
                 )
             )
-            before = measured("before", backend)
+            before = measured("before", backend, kept_as=kept_incumbent)
         else:
             # The incumbent is the original: its drift from it is zero.
             backend.scale_delta(baseline, trained, 0)
-            before = measured("before", backend, identical=True)
+            before = measured("before", backend, identical=True, kept_as=kept_incumbent)
         # Under Dreams the gate judges what each version writes (judged.py):
         # the version in use answers each moment now, while it is loaded.
         from . import judged
@@ -945,7 +980,9 @@ def run(config, store, slice_seconds=None, sizing=None):
         before_answers = {}
         if moments:
             try:
-                before_answers = judged.answers(backend, journal, moments, "before", check)
+                before_answers = judged.answers(
+                    backend, journal, moments, "before", check, kept_as=kept_incumbent
+                )
             except (Interrupted, MemoryError):
                 raise
             except Exception as exc:  # noqa: BLE001 - judging falls back, never fails the Dream

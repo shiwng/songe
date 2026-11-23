@@ -212,6 +212,57 @@ class ReferenceCache:
         temporary.replace(path)
 
 
+class KeptMeasurements:
+    """The incumbent's gate measurements kept across Dreams.
+
+    While the version in use, its teacher and the base stay the same, its
+    score, drift and answer health at a moment do not change, so the next
+    Dream reuses them instead of measuring the incumbent again (a third of
+    the gate). fingerprint names everything they depend on; one folder per
+    fingerprint, others removed when this one is first written."""
+
+    def __init__(self, root, fingerprint):
+        self.root = Path(root)
+        self.folder = self.root / digest(fingerprint)[:24]
+        self.pruned = False
+
+    def path(self, kind, ref):
+        """ref: a gate reference (what it reads) or any JSON identity."""
+        if isinstance(ref, dict):
+            ref = [list(ref["prompt"]), list(ref.get("teacher") or []), list(ref["y"])]
+        return self.folder / f"{kind}-{digest([kind, ref])}.json"
+
+    def get(self, kind, ref):
+        try:
+            return json.loads(self.path(kind, ref).read_text(encoding="utf-8"))["value"]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def put(self, kind, ref, value):
+        if not self.pruned:
+            self.pruned = True
+            if self.root.is_dir():
+                for other in self.root.iterdir():
+                    if other.is_dir() and other != self.folder:
+                        shutil.rmtree(other, ignore_errors=True)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        path = self.path(kind, ref)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"value": value}), encoding="utf-8")
+        temporary.replace(path)
+
+
+def kept(cache, kind, ref, measure):
+    """cache's value for this moment, else measure() (kept for next time)."""
+    if cache is None:
+        return measure()
+    value = cache.get(kind, ref)
+    if value is None:
+        value = measure()
+        cache.put(kind, ref, value)
+    return value
+
+
 def kl_between(base, candidate, prompt, teacher_prompt, y, *, hindsight=False, views=None, state=None):
     # Held-out hindsight KL uses the same teacher as training (the version
     # the cycle started from); retention drift stays against the original base.
@@ -258,6 +309,36 @@ def drift_choice(general, drift_values, drift_refs, config):
     return info["drift_set"], info
 
 
+def measure_row(base, candidate, r, views):
+    """One held-out moment for one version: the score against the cycle's
+    teacher and the health of the version's own answer."""
+    # The prompt is read once for the score and the answer.
+    state = candidate.prompt_state(r["prompt"]) if hasattr(candidate, "prompt_state") else None
+    kl = kl_between(
+        base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True, views=views,
+        state=state,
+    )
+    _, text, _ = candidate.sample(
+        r["prompt"], seed=7613, **({} if state is None else {"state": state})
+    )
+    state = None
+    return {
+        "kl": kl,
+        "tool_step": r["tool_step"],
+        **{
+            k: v
+            for k, v in health(
+                text,
+                candidate.tokenizer,
+                r["tools"],
+                r["tool_step"],
+                candidate.config.repetition_ngram,
+            ).items()
+            if k != "calls"  # gate rows keep measurements only
+        },
+    }
+
+
 def evaluate(
     base,
     candidate,
@@ -269,6 +350,7 @@ def evaluate(
     commit=lambda: None,
     identical=False,
     views=None,
+    kept_as=None,
 ):
     """Gate rows for one version against the frozen base.
 
@@ -277,7 +359,9 @@ def evaluate(
     measured; held-out rows still are.
 
     views: a dict shared by the versions of one gate, so the reference's
-    read of each moment (the same for every version) is done once."""
+    read of each moment (the same for every version) is done once.
+    kept_as: a KeptMeasurements for a version measured again on later
+    Dreams (the incumbent): moments it has measured are not measured again."""
     checkpoint = {} if checkpoint is None else checkpoint
     # The drift set first: the same measure on real contexts where the base
     # was right (confirmed successes). Never trained on. When it can decide
@@ -288,7 +372,8 @@ def evaluate(
             drift_set.append(0.0)
             continue
         getattr(candidate, "boundary", candidate.check)()
-        drift_set.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"], views=views))
+        drift_set.append(kept(kept_as, "drift", r, lambda r=r: kl_between(
+            base, candidate, r["prompt"], r["prompt"], r["y"], views=views)))
         commit()
     drifts = checkpoint.setdefault("drifts", [])
     _, decided = drift_choice(None, drift_set, list(drift_refs), candidate.config)
@@ -302,7 +387,8 @@ def evaluate(
                 drifts.append(0.0)
                 continue
             getattr(candidate, "boundary", candidate.check)()
-            drifts.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"], views=views))
+            drifts.append(kept(kept_as, "general", r, lambda r=r: kl_between(
+                base, candidate, r["prompt"], r["prompt"], r["y"], views=views)))
             commit()
     commit()
     drift, checkpoint["drift_check"] = drift_choice(
@@ -311,35 +397,7 @@ def evaluate(
     rows = checkpoint.setdefault("rows", [])
     for r in refs[len(rows) :]:
         getattr(candidate, "boundary", candidate.check)()
-        # The prompt is read once for the score and the answer.
-        state = candidate.prompt_state(r["prompt"]) if hasattr(candidate, "prompt_state") else None
-        kl = kl_between(
-            base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True, views=views,
-            state=state,
-        )
-        _, text, _ = candidate.sample(
-            r["prompt"], seed=7613, **({} if state is None else {"state": state})
-        )
-        state = None
-        rows.append(
-            {
-                "id": r["id"],
-                "conversation": r["conversation"],
-                "kl": kl,
-                "drift": drift,
-                "tool_step": r["tool_step"],
-                **{
-                    k: v
-                    for k, v in health(
-                        text,
-                        candidate.tokenizer,
-                        r["tools"],
-                        r["tool_step"],
-                        candidate.config.repetition_ngram,
-                    ).items()
-                    if k != "calls"  # gate rows keep measurements only
-                },
-            }
-        )
+        measured = kept(kept_as, "row", r, lambda r=r: measure_row(base, candidate, r, views))
+        rows.append({"id": r["id"], "conversation": r["conversation"], "drift": drift, **measured})
         commit()
     return rows

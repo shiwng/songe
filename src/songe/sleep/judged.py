@@ -103,12 +103,20 @@ def write(backend, step):
     return {"tokens": list(y), **answer(text, backend.tokenizer, step.get("tools"))}
 
 
-def answers(backend, journal, steps, name, check):
-    """Every moment's answer by the loaded version, resumable."""
+def answers(backend, journal, steps, name, check, kept_as=None):
+    """Every moment's answer by the loaded version, resumable. kept_as: a
+    KeptMeasurements (the incumbent's answers, reused on later Dreams)."""
+    from ..steps import revision_id
+    from .evaluate import kept
+
     out = {}
     for step in steps:
         check()
-        out[step["id"]] = journal.unit(f"judged-{name}-{step['id']}", lambda step=step: write(backend, step))
+        out[step["id"]] = journal.unit(
+            f"judged-{name}-{step['id']}",
+            lambda step=step: kept(kept_as, f"answer{ANSWER_TOKENS}", [step["id"], revision_id(step)],
+                                   lambda: write(backend, step)),
+        )
     return out
 
 
