@@ -96,6 +96,7 @@ def _classes():
             self.packed = True
 
         def weight(self, name, index, dtype):
+            """One expert's bf16 weight, or several stacked (index a tensor)."""
             codes = getattr(self, f"{name}_codes")[index]
             scale = getattr(self, f"{name}_scale")[index]
             if self.host:
@@ -106,26 +107,57 @@ def _classes():
                 values = codes.float().view(*scale.shape, 32) * torch.exp2(scale - 127)[..., None]
                 return values.reshape(codes.shape).to(dtype)
             values = self.byte_values[codes.long()].view(*scale.shape, 16) * scale[..., None]
-            values = values * getattr(self, f"{name}_factor")[index]
-            return values.reshape(codes.shape[0], codes.shape[1] * 2).to(dtype)
+            factor = getattr(self, f"{name}_factor")[index]
+            values = values * factor.view(-1, *[1] * (values.dim() - 1)) if factor.dim() else values * factor
+            return values.reshape(*codes.shape[:-1], codes.shape[-1] * 2).to(dtype)
+
+        # Decoding (a few tokens, no gradient) takes the batched path below.
+        SMALL = 32
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
+            if top_k_index.numel() <= self.SMALL and not torch.is_grad_enabled() and not self.host:
+                return self._small(hidden_states, top_k_index, top_k_weights)
             # As Inkling2LoopExperts.forward, with packed weights.
+            # Tokens grouped by expert with one device sync per layer (the
+            # counts), not one per expert hit: decoding one token visits ~50
+            # expert layers (loops included) and the per-expert syncs held
+            # Inkling-2-Mini to ~2.5 tokens/s. Same sums: a token picks an
+            # expert at most once, so the order within an expert is free.
             final = torch.zeros_like(hidden_states, dtype=torch.float32)
+            k = top_k_index.shape[-1]
             with torch.no_grad():
-                mask = F.one_hot(top_k_index, num_classes=self.num_experts + 1).permute(2, 1, 0)
-                hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert in hit:
-                e = int(expert[0])
-                if e == self.num_experts:
+                flat = top_k_index.reshape(-1)
+                order = flat.argsort(stable=True)
+                counts = torch.bincount(flat, minlength=self.num_experts + 1).tolist()
+            start = 0
+            for e, count in enumerate(counts):
+                chosen, start = order[start : start + count], start + count
+                if not count or e >= self.num_experts:
                     continue
-                top_k_pos, token_idx = torch.where(mask[e])
+                token_idx, top_k_pos = chosen // k, chosen % k
                 state = hidden_states[token_idx]
                 gate, up = PackedLinear.apply(state, self, "w13", e).chunk(2, dim=-1)
                 state = PackedLinear.apply(self.act_fn(gate, up), self, "w2", e)
                 state = state * top_k_weights[token_idx, top_k_pos, None]
                 final.index_add_(0, token_idx, state.to(final.dtype))
             return final.to(hidden_states.dtype)
+
+        def _small(self, hidden_states, top_k_index, top_k_weights):
+            """All (token, expert) pairs at once: their experts unpacked as one
+            batch and one batched matmul per projection, with no device sync.
+            Decoding was launch-bound: ~30k kernel launches and ~3k syncs per
+            token on Inkling-2-Mini, ~110 ms of GPU work in ~430 ms."""
+            tokens, k = top_k_index.shape
+            flat = top_k_index.reshape(-1)
+            valid = flat < self.num_experts  # num_experts: no expert (masked)
+            chosen = flat.clamp(max=self.num_experts - 1)
+            state = hidden_states.repeat_interleave(k, dim=0)[:, :, None]
+            gate_up = torch.bmm(self.weight("w13", chosen, hidden_states.dtype), state)[..., 0]
+            gate, up = gate_up.chunk(2, dim=-1)
+            act = self.act_fn(gate, up)[:, :, None]
+            out = torch.bmm(self.weight("w2", chosen, hidden_states.dtype), act)[..., 0]
+            out = out * (top_k_weights.reshape(-1) * valid)[:, None]  # promotes as the loop does
+            return out.view(tokens, k, -1).float().sum(1).to(hidden_states.dtype)
 
     return m, PackedExperts
 

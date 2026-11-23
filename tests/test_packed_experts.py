@@ -91,6 +91,28 @@ def test_forward_and_input_gradient_match_dequantized_experts(config):
     assert not any(p.requires_grad for p in packed.buffers())
 
 
+@pytest.mark.parametrize("make", [nvfp4, mxfp8])
+def test_decoding_path_matches_the_expert_loop(config, make):
+    """A few tokens without gradients take the batched path; same output as
+    the per-expert loop, masked slots (index num_experts) included."""
+    generator = torch.Generator().manual_seed(13)
+    tensors, _, _ = layer(config, make, generator)
+    _, PackedExperts = packed_experts._classes()
+    packed = PackedExperts(config)
+    packed.load_packed(tensors, torch.device("cpu"))
+    for tokens in (1, 3):
+        index = torch.randint(0, config.n_routed_experts, (tokens, 2), generator=generator)
+        index[0, 1] = config.n_routed_experts
+        weights = torch.rand(tokens, 2, generator=generator)
+        x = torch.randn(tokens, config.hidden_size, generator=generator).to(torch.bfloat16)
+        with torch.no_grad():
+            small = packed(x, index, weights)
+            packed.SMALL = 0
+            loop = packed(x, index, weights)
+            del packed.SMALL
+        torch.testing.assert_close(small, loop)
+
+
 def test_only_modelopt_inkling_checkpoints_are_packed():
     from types import SimpleNamespace
 
