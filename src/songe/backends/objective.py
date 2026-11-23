@@ -47,3 +47,10 @@ def divergence(
     mix = mx.logaddexp(math.log(beta) + t, math.log(1 - beta) + s)
     value = (beta * mx.exp(t) * (t - mix) + (1 - beta) * mx.exp(s) * (s - mix)).sum(-1)
     return value if reduction == "none" else value.mean()
+
+
+def view_key(hindsight, teacher_prompt, y):
+    """Which reference view of a moment a kept one is (kl_from's views):
+    whose weights read it (the teacher, or the frozen base), the context and
+    the answer."""
+    return (bool(hindsight), len(teacher_prompt), hash(tuple(teacher_prompt)), tuple(y))

@@ -13,11 +13,15 @@ import uuid
 from ..sleep.prompts import paired_prompts, response_positions
 from ..steps import tool_outcome
 from ..storage import private_dir, write_json
-from .objective import divergence
+from .objective import divergence, view_key
 
 
 class Backend:
     kind = "mlx"
+    # TorchBackend reads in bigger chunks in the gate; MLX keeps
+    # teacher_chunk: Metal running out of memory ends the process rather
+    # than raising, so a chunk cannot be tried and halved.
+    read_chunk = None
 
     def __init__(self, config, check=lambda: None, train=True):
         import mlx.core as mx
@@ -367,12 +371,18 @@ class Backend:
             "reason": "Explicit successful logged actions only",
         }
 
-    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False):
+    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False, views=None):
+        """views: as TorchBackend.kl_from (the reference's view, read once)."""
         reference = base.teacher if hindsight else base.base
         mx = self.mx
-        with reference():
-            teacher_h = base.teacher_hidden(teacher_prompt, y)
-            mx.eval(teacher_h)
+        key = view_key(hindsight, teacher_prompt, y) if views is not None else None
+        teacher_h = views.get(key) if key is not None else None
+        if teacher_h is None:
+            with reference():
+                teacher_h = base.teacher_hidden(teacher_prompt, y)
+                mx.eval(teacher_h)
+            if key is not None:
+                views[key] = teacher_h
         candidate_h = self.hidden(prompt + y[:-1])[:, response_positions(prompt, y)]
         mx.eval(candidate_h)
         total = 0.0

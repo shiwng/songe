@@ -31,6 +31,9 @@ from ..schedule import resumable as can_resume
 from ..steps import digest, revision_id
 from ..storage import private_dir, write_json
 
+# Tokens per no-gradient pass in the gate (see TorchBackend.read_chunk).
+GATE_READ_CHUNK = 4096
+
 
 def general_steps():
     prompts = json.loads(
@@ -786,6 +789,12 @@ def run(config, store, slice_seconds=None, sizing=None):
         }
         if any(s["id"] in waiting for s in night_gate):
             raise Interrupted("Waiting for memory: intact training samples deferred")
+        # The gate reads without gradients, after training: bigger chunks
+        # (fewer passes) are much faster where each pass has a fixed cost
+        # (Inkling-2-Mini unpacks its experts per pass: 4.5x at 32k), and
+        # halve themselves if memory runs short (TorchBackend.reading).
+        if backend.kind == "torch":
+            backend.read_chunk = max(GATE_READ_CHUNK, config.teacher_chunk)
 
         # Gate work is cached by what it scores (the examples and response
         # length), not by this slice's memory sizing, which changes almost
@@ -871,6 +880,10 @@ def run(config, store, slice_seconds=None, sizing=None):
                 general_memo.append(reference_set("general-references", anchors))
             return general_memo[0]
 
+        # The reference's read of each moment, shared by the versions below
+        # (it does not depend on the version measured).
+        views = {}
+
         def measured(name, candidate, identical=False):
             name += "-" + gate_key(heldout + anchors + drift_set)
             cache = journal.load(name, {})
@@ -893,6 +906,7 @@ def run(config, store, slice_seconds=None, sizing=None):
                 checkpoint=cache,
                 commit=commit,
                 identical=identical,
+                views=views,
             )
             # Which "not broken" measure gated, and why (see evaluate), and
             # the measured values, for the cycle record's checks.

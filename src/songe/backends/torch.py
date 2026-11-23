@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..sleep.prompts import paired_prompts, response_positions
+from .objective import view_key
 from .reference import TAIL_FLOOR
 
 
@@ -413,17 +414,47 @@ class TorchBackend:
         cache = getattr(output, "past_key_values", None)
         return cache if cache is not None else getattr(output, "cache", None)
 
+    # Reads with no gradient (the frozen teacher, a prompt before sampling)
+    # go in chunks of this many tokens; None: config.teacher_chunk, the
+    # size training is measured with. The gate sets bigger chunks (worker:
+    # GATE_READ_CHUNK), halved on running out of memory (_bounded), never
+    # below teacher_chunk: on Inkling-2-Mini each chunk unpacks its experts again,
+    # and 4096-token chunks read 4.5x faster than 512 (H100, 2026-11-23).
+    read_chunk = None
+
+    def _chunk(self):
+        return self.read_chunk or self.config.teacher_chunk
+
+    def _bounded(self, read):
+        """read(), retried with half the chunk when it runs out of memory."""
+        oom = getattr(self.torch, "OutOfMemoryError", None) or self.torch.cuda.OutOfMemoryError
+        while True:
+            try:
+                return read()
+            except oom:
+                if not self.read_chunk or self.read_chunk <= self.config.teacher_chunk:
+                    raise
+                self.read_chunk = max(self.config.teacher_chunk, self.read_chunk // 2)
+                if self.device.type == "cuda":
+                    self.torch.cuda.empty_cache()
+                import logging
+
+                logging.getLogger("songe").info("read_chunk_reduced %d", self.read_chunk)
+
     def prefix_state(self, ids):
         """Read ids with no gradient in chunks; keep only the model cache."""
         if not ids:
             return None
-        past = None
+        return self._bounded(lambda: self._prefix_state(ids))
+
+    def _prefix_state(self, ids):
+        past, chunk = None, self._chunk()
         with self.torch.no_grad():
-            for start in range(0, len(ids), self.config.teacher_chunk):
+            for start in range(0, len(ids), chunk):
                 self.check()
                 out = self._causal().base_model(
                     input_ids=self.torch.tensor(
-                        [ids[start : start + self.config.teacher_chunk]],
+                        [ids[start : start + chunk]],
                         device=self.device,
                     ),
                     past_key_values=past,
@@ -496,7 +527,7 @@ class TorchBackend:
         was_training = self.model.training
         self.model.eval()
         started = time.monotonic()
-        if len(prompt_ids) > self.config.teacher_chunk:
+        if len(prompt_ids) > self._chunk():
             # A long prompt is read in chunks, as the teacher reads it: one
             # pass over the whole prompt can need far more memory than the
             # training step (quadratic attention, Inkling-2).
@@ -562,29 +593,33 @@ class TorchBackend:
     def teacher_hidden(self, prompt, y, teacher=None):
         """Full frozen context in bounded prefill chunks, without an autograd graph.
         teacher: the context that selects the teacher's weights (default base)."""
+        with teacher if teacher is not None else self.base():
+            return self._bounded(lambda: self._frozen_hidden(prompt, y))
+
+    def _frozen_hidden(self, prompt, y):
         ids = prompt + y[:-1]
         positions = response_positions(prompt, y)
-        with teacher if teacher is not None else self.base():
-            if len(ids) <= self.config.teacher_chunk:
-                return self._response_hidden(prompt, y).detach()
-            past, parts = None, []
-            for start in range(0, len(ids), self.config.teacher_chunk):
-                self.check()
-                end = min(len(ids), start + self.config.teacher_chunk)
-                out = self._causal().base_model(
-                    input_ids=self.torch.tensor([ids[start:end]], device=self.device),
-                    past_key_values=past,
-                    use_cache=True,
-                    return_dict=True,
+        chunk = self._chunk()
+        if len(ids) <= chunk:
+            return self._response_hidden(prompt, y).detach()
+        past, parts = None, []
+        for start in range(0, len(ids), chunk):
+            self.check()
+            end = min(len(ids), start + chunk)
+            out = self._causal().base_model(
+                input_ids=self.torch.tensor([ids[start:end]], device=self.device),
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = self._cache(out)
+            if end > positions.start:
+                parts.append(
+                    out.last_hidden_state[
+                        :, max(0, positions.start - start) :
+                    ].detach()
                 )
-                past = self._cache(out)
-                if end > positions.start:
-                    parts.append(
-                        out.last_hidden_state[
-                            :, max(0, positions.start - start) :
-                        ].detach()
-                    )
-            return self.torch.cat(parts, dim=1)
+        return self.torch.cat(parts, dim=1)
 
     def compare(self, student_ids, teacher_ids, y, kind="forward_kl"):
         teacher_h = self.teacher_hidden(teacher_ids, y, self.teacher())
@@ -853,13 +888,26 @@ class TorchBackend:
         elif self._process is not None:
             self._peak_rss = self._process.memory_info().rss
 
-    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False):
+    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False, views=None):
+        """views: a dict kept across the versions one gate measures. The
+        reference's view of a moment (the frozen base, or the cycle's
+        teacher) is the same for every version, so it is read once and kept
+        in host RAM (a few MB per moment) instead of once per version."""
         reference = base.teacher if hindsight else base.base
-        with reference():
-            teacher_h = base.teacher_hidden(teacher_prompt, y)
+        key = view_key(hindsight, teacher_prompt, y) if views is not None else None
+        teacher_h = views.get(key) if key is not None else None
+        if teacher_h is None:
+            with reference():
+                teacher_h = base.teacher_hidden(teacher_prompt, y)
+            if key is not None:
+                views[key] = teacher_h.to("cpu")
+        teacher_h = teacher_h.to(self.device)
         total = 0.0
         with self.torch.no_grad():
-            candidate_h = self._response_hidden(prompt, y)
+            # In chunks, as the teacher reads: one pass over a long context
+            # was slower and twice the memory (Inkling-2-Mini at 32k: 72 s,
+            # 45 GB, against 34 s, 24 GB in 4096-token chunks).
+            candidate_h = self.teacher_hidden(prompt, y, contextlib.nullcontext())
             for start in range(0, len(y), base.config.token_chunk):
                 self.check()
                 end = min(start + base.config.token_chunk, len(y))

@@ -212,10 +212,12 @@ class ReferenceCache:
         temporary.replace(path)
 
 
-def kl_between(base, candidate, prompt, teacher_prompt, y, *, hindsight=False):
+def kl_between(base, candidate, prompt, teacher_prompt, y, *, hindsight=False, views=None):
     # Held-out hindsight KL uses the same teacher as training (the version
     # the cycle started from); retention drift stays against the original base.
-    return candidate.kl_from(base, prompt, teacher_prompt, y, hindsight=hindsight)
+    # views: the reference's reads kept across versions (see kl_from).
+    extra = {} if views is None else {"views": views}
+    return candidate.kl_from(base, prompt, teacher_prompt, y, hindsight=hindsight, **extra)
 
 
 def interval(values_by_cluster, confidence, bootstraps=2000):
@@ -263,12 +265,16 @@ def evaluate(
     checkpoint=None,
     commit=lambda: None,
     identical=False,
+    views=None,
 ):
     """Gate rows for one version against the frozen base.
 
     identical: this version is the base itself (the first Dream's
     incumbent), so its drift from the base is zero by definition and is not
-    measured; held-out rows still are."""
+    measured; held-out rows still are.
+
+    views: a dict shared by the versions of one gate, so the reference's
+    read of each moment (the same for every version) is done once."""
     checkpoint = {} if checkpoint is None else checkpoint
     # The drift set first: the same measure on real contexts where the base
     # was right (confirmed successes). Never trained on. When it can decide
@@ -279,7 +285,7 @@ def evaluate(
             drift_set.append(0.0)
             continue
         getattr(candidate, "boundary", candidate.check)()
-        drift_set.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"]))
+        drift_set.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"], views=views))
         commit()
     drifts = checkpoint.setdefault("drifts", [])
     _, decided = drift_choice(None, drift_set, list(drift_refs), candidate.config)
@@ -293,7 +299,7 @@ def evaluate(
                 drifts.append(0.0)
                 continue
             getattr(candidate, "boundary", candidate.check)()
-            drifts.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"]))
+            drifts.append(kl_between(base, candidate, r["prompt"], r["prompt"], r["y"], views=views))
             commit()
     commit()
     drift, checkpoint["drift_check"] = drift_choice(
@@ -303,7 +309,7 @@ def evaluate(
     for r in refs[len(rows) :]:
         getattr(candidate, "boundary", candidate.check)()
         kl = kl_between(
-            base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True
+            base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True, views=views
         )
         _, text, _ = candidate.sample(r["prompt"], seed=7613)
         rows.append(
