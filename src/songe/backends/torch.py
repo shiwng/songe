@@ -512,7 +512,8 @@ class TorchBackend:
         finally:
             generation.eos_token_id = original
 
-    def sample(self, prompt_ids, seed=None, *, deterministic=False, max_tokens=None):
+    def sample(self, prompt_ids, seed=None, *, deterministic=False, max_tokens=None, state=None):
+        """state: prompt_state(prompt_ids), consumed (the prompt is not read again)."""
         torch = self.torch
         if not prompt_ids:
             raise ValueError("Sampling requires a nonempty prompt")
@@ -527,11 +528,11 @@ class TorchBackend:
         was_training = self.model.training
         self.model.eval()
         started = time.monotonic()
-        if len(prompt_ids) > self._chunk():
+        if state is not None or len(prompt_ids) > self._chunk():
             # A long prompt is read in chunks, as the teacher reads it: one
             # pass over the whole prompt can need far more memory than the
             # training step (quadratic attention, Inkling-2).
-            past = self.prefix_state(prompt_ids[:-1])
+            past = state if state is not None else self.prefix_state(prompt_ids[:-1])
             inputs = torch.tensor([prompt_ids[-1:]], device=self.device)
         prompt_seconds = 0.0
         eos = self._causal().generation_config.eos_token_id
@@ -596,29 +597,37 @@ class TorchBackend:
         with teacher if teacher is not None else self.base():
             return self._bounded(lambda: self._frozen_hidden(prompt, y))
 
-    def _frozen_hidden(self, prompt, y):
-        ids = prompt + y[:-1]
-        positions = response_positions(prompt, y)
-        chunk = self._chunk()
-        if len(ids) <= chunk:
-            return self._response_hidden(prompt, y).detach()
-        past, parts = None, []
-        for start in range(0, len(ids), chunk):
+    def prompt_state(self, prompt):
+        """The model cache after prompt[:-1], read in chunks with no
+        gradient, for reading or sampling what follows more than once
+        (kl_from, sample: state=); None for a prompt read in one pass.
+        Every user continues from its own copy or is the last one."""
+        if len(prompt) <= self._chunk():
+            return None
+        return self.prefix_state(prompt[:-1])
+
+    def _frozen_hidden(self, prompt, y, state=None):
+        """The hidden states that predict y: a short prompt in one pass; a
+        long one in chunks (or from state), then prompt[-1:] + y[:-1] as a
+        continuation. Every reader of a context uses this same layout, so
+        identical weights read identically: chunk boundaries alone move
+        Inkling-2-Mini's per-token KL by ~0.005 (bf16, MoE routing)."""
+        if state is None:
+            if len(prompt) <= self._chunk():
+                return self._response_hidden(prompt, y).detach()
+            state = self._prefix_state(prompt[:-1])
+        rest, chunk = prompt[-1:] + y[:-1], self._chunk()
+        past, parts = state, []
+        for start in range(0, len(rest), chunk):
             self.check()
-            end = min(len(ids), start + chunk)
             out = self._causal().base_model(
-                input_ids=self.torch.tensor([ids[start:end]], device=self.device),
+                input_ids=self.torch.tensor([rest[start : start + chunk]], device=self.device),
                 past_key_values=past,
                 use_cache=True,
                 return_dict=True,
             )
             past = self._cache(out)
-            if end > positions.start:
-                parts.append(
-                    out.last_hidden_state[
-                        :, max(0, positions.start - start) :
-                    ].detach()
-                )
+            parts.append(out.last_hidden_state.detach())
         return self.torch.cat(parts, dim=1)
 
     def compare(self, student_ids, teacher_ids, y, kind="forward_kl"):
@@ -888,11 +897,13 @@ class TorchBackend:
         elif self._process is not None:
             self._peak_rss = self._process.memory_info().rss
 
-    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False, views=None):
+    def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False, views=None, state=None):
         """views: a dict kept across the versions one gate measures. The
         reference's view of a moment (the frozen base, or the cycle's
         teacher) is the same for every version, so it is read once and kept
-        in host RAM (a few MB per moment) instead of once per version."""
+        in host RAM (a few MB per moment) instead of once per version.
+        state: this version's prompt_state(prompt), continued from a copy
+        (the caller samples from it next)."""
         reference = base.teacher if hindsight else base.base
         key = view_key(hindsight, teacher_prompt, y) if views is not None else None
         teacher_h = views.get(key) if key is not None else None
@@ -907,7 +918,12 @@ class TorchBackend:
             # In chunks, as the teacher reads: one pass over a long context
             # was slower and twice the memory (Inkling-2-Mini at 32k: 72 s,
             # 45 GB, against 34 s, 24 GB in 4096-token chunks).
-            candidate_h = self.teacher_hidden(prompt, y, contextlib.nullcontext())
+            if state is not None:
+                candidate_h = self._bounded(
+                    lambda: self._frozen_hidden(prompt, y, copy.deepcopy(state))
+                )
+            else:
+                candidate_h = self.teacher_hidden(prompt, y, contextlib.nullcontext())
             for start in range(0, len(y), base.config.token_chunk):
                 self.check()
                 end = min(start + base.config.token_chunk, len(y))

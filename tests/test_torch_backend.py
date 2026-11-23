@@ -551,3 +551,23 @@ def test_gate_reads_in_bigger_chunks_and_halves_them_out_of_memory(backend, step
     with pytest.raises(torch.OutOfMemoryError):  # at teacher_chunk: no smaller retry
         backend.teacher_hidden(prompt, y)
     assert sizes == [32]
+
+
+def test_one_prompt_read_serves_the_score_and_the_answer(backend, step):
+    """prompt_state: the score continues from a copy, the answer from the
+    state itself; both match reading the prompt again, and an unchanged
+    model drifts exactly zero (reference and candidate read alike)."""
+    prompt, teacher = paired_prompts(backend.tokenizer, step, backend.config)
+    prompt = prompt * 6
+    y = [1, 2, 3, 4]
+    backend.config.teacher_chunk = 8
+    plain_kl = backend.kl_from(backend, prompt, teacher, y, hindsight=True)
+    plain_answer, _, _ = backend.sample(prompt, seed=7613)
+    state = backend.prompt_state(prompt)
+    assert state is not None and backend.prompt_state(prompt[:8]) is None
+    shared_kl = backend.kl_from(backend, prompt, teacher, y, hindsight=True, state=state)
+    shared_answer, _, _ = backend.sample(prompt, seed=7613, state=state)
+    assert shared_kl == pytest.approx(plain_kl, abs=1e-5)
+    assert shared_answer == plain_answer
+    with backend.base():
+        assert backend.kl_from(backend, prompt, prompt, y) == 0.0

@@ -212,11 +212,14 @@ class ReferenceCache:
         temporary.replace(path)
 
 
-def kl_between(base, candidate, prompt, teacher_prompt, y, *, hindsight=False, views=None):
+def kl_between(base, candidate, prompt, teacher_prompt, y, *, hindsight=False, views=None, state=None):
     # Held-out hindsight KL uses the same teacher as training (the version
     # the cycle started from); retention drift stays against the original base.
-    # views: the reference's reads kept across versions (see kl_from).
+    # views: the reference's reads kept across versions; state: the
+    # candidate's read of the prompt, shared with its answer (see kl_from).
     extra = {} if views is None else {"views": views}
+    if state is not None:
+        extra["state"] = state
     return candidate.kl_from(base, prompt, teacher_prompt, y, hindsight=hindsight, **extra)
 
 
@@ -308,10 +311,16 @@ def evaluate(
     rows = checkpoint.setdefault("rows", [])
     for r in refs[len(rows) :]:
         getattr(candidate, "boundary", candidate.check)()
+        # The prompt is read once for the score and the answer.
+        state = candidate.prompt_state(r["prompt"]) if hasattr(candidate, "prompt_state") else None
         kl = kl_between(
-            base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True, views=views
+            base, candidate, r["prompt"], r["teacher"], r["y"], hindsight=True, views=views,
+            state=state,
         )
-        _, text, _ = candidate.sample(r["prompt"], seed=7613)
+        _, text, _ = candidate.sample(
+            r["prompt"], seed=7613, **({} if state is None else {"state": state})
+        )
+        state = None
         rows.append(
             {
                 "id": r["id"],

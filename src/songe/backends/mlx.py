@@ -23,6 +23,11 @@ class Backend:
     # than raising, so a chunk cannot be tried and halved.
     read_chunk = None
 
+    def prompt_state(self, prompt):
+        """No shared prompt read on MLX (TorchBackend.prompt_state): each
+        user reads the prompt itself."""
+        return None
+
     def __init__(self, config, check=lambda: None, train=True):
         import mlx.core as mx
         import mlx.nn as nn
